@@ -1,180 +1,111 @@
 #![feature(slice_group_by)]
+#![feature(never_type)]
 
-use std::sync::Arc;
+mod hook;
 
-use async_trait::async_trait;
-use futures_concurrency::prelude::*;
+use hook::{AsyncParallelHook, AsyncSeriesHook, Hook, Plugin, SyncBailHookMap};
 
 struct Compilation;
-
-#[derive(Default)]
-struct CompilationHooks {
-    make: Vec<Arc<dyn AsyncParallel<Make>>>,
-    process_assets: Vec<Arc<dyn AsyncSeries<ProcessAssets>>>,
-}
-
-impl CompilationHooks {
-    async fn call_make(&mut self, input: &Compilation) {
-        self.make.sort_by_key(|hook| hook.stage());
-        let groupes = self.make.group_by(|a, b| a.stage() == b.stage());
-        for group in groupes {
-            execute_async_parallel(group, input).await;
-        }
-    }
-    async fn call_process_assets(&mut self, input: &mut Compilation) {
-        self.process_assets.sort_by_key(|hook| hook.stage());
-        execute_async_series(&self.process_assets, input).await;
-    }
-}
-
-#[async_trait::async_trait]
-trait AsyncSeries<H: Hook> {
-    async fn run(&self, input: &mut H::Input) -> H::Output;
-    fn stage(&self) -> i32 {
-        0
-    }
-}
-
-#[async_trait::async_trait]
-impl<H: Hook, T: Fn(&mut H::Input) -> H::Output + Send + Sync> AsyncSeries<H> for T {
-    async fn run(&self, input: &mut H::Input) -> H::Output {
-        self(input)
-    }
-}
-
-#[async_trait::async_trait]
-impl<H: Hook, T: Fn(&mut H::Input) -> H::Output + Send + Sync> AsyncSeries<H> for (T, i32) {
-    async fn run(&self, input: &mut H::Input) -> H::Output {
-        self.0(input)
-    }
-    fn stage(&self) -> i32 {
-        self.1
-    }
-}
-
-async fn execute_async_series<'c, I, H: Hook<Input = I, Output = ()>>(
-    hooks: &[Arc<dyn AsyncSeries<H>>],
-    input: &'c mut I,
-) {
-    for hook in hooks {
-        hook.run(input).await;
-    }
-}
-
-#[async_trait::async_trait]
-trait AsyncParallel<H: Hook> {
-    async fn run(&self, input: &H::Input) -> H::Output;
-    fn stage(&self) -> i32 {
-        0
-    }
-}
-
-#[async_trait::async_trait]
-impl<H: Hook, T: Fn(&H::Input) -> H::Output + Send + Sync> AsyncParallel<H> for T {
-    async fn run(&self, input: &H::Input) -> H::Output {
-        self(input)
-    }
-}
-
-#[async_trait::async_trait]
-impl<H: Hook, T: Fn(&H::Input) -> H::Output + Send + Sync> AsyncParallel<H> for (T, i32) {
-    async fn run(&self, input: &H::Input) -> H::Output {
-        self.0(input)
-    }
-    fn stage(&self) -> i32 {
-        self.1
-    }
-}
-
-async fn execute_async_parallel<'c, I, H: Hook<Input = I, Output = ()>>(
-    hooks: &[Arc<dyn AsyncParallel<H>>],
-    input: &'c I,
-) {
-    let futs: Vec<_> = hooks.into_iter().map(|hook| hook.run(input)).collect();
-    futs.join().await;
-}
-
-trait Hook {
-    type Input: Send + Sync;
-    type Output;
-}
 
 struct Make;
 
 impl Hook for Make {
     type Input = Compilation;
-    type Output = ();
+    type Output = !;
 }
 
 struct ProcessAssets;
 
 impl Hook for ProcessAssets {
     type Input = Compilation;
-    type Output = ();
+    type Output = !;
 }
 
-trait Plugin<HookContainer> {
-    fn tap_hooks(&self, hook_container: &mut HookContainer);
+#[derive(Default)]
+struct CompilationHooks {
+    make: AsyncParallelHook<Make>,
+    process_assets: AsyncSeriesHook<ProcessAssets>,
+}
+
+struct Ast;
+
+#[derive(Debug)]
+struct BasicEvaluatedExpression;
+
+struct Evaluate;
+
+impl Hook for Evaluate {
+    type Input = Ast;
+    type Output = BasicEvaluatedExpression;
+}
+
+#[derive(Default)]
+struct ParserHooks {
+    evaluate: SyncBailHookMap<Evaluate>,
 }
 
 struct APlugin;
 
-#[async_trait::async_trait]
-impl AsyncParallel<Make> for APlugin {
-    async fn run(&self, _compilation: &Compilation) {
-        println!("APlugin: make {}", AsyncParallel::stage(self));
+impl Plugin<CompilationHooks> for APlugin {
+    fn apply(&self, hook_container: &mut CompilationHooks) {
+        hook_container.make.tap((
+            |_compilation: &Compilation| async {
+                println!("APlugin: CompilationHooks.make -10");
+            },
+            -10,
+        ));
+        hook_container
+            .process_assets
+            .tap(|_compilation: &mut Compilation| async {
+                println!("APlugin: CompilationHooks.processAssets");
+            });
     }
 }
 
-impl Plugin<CompilationHooks> for Arc<APlugin> {
-    fn tap_hooks(&self, hook_container: &mut CompilationHooks) {
-        let make_stage = -10;
-        let make_fn = move |_compilation: &Compilation| {
-            println!("APlugin: make {}", make_stage);
-        };
-        hook_container.make.push(Arc::new((make_fn, make_stage)));
+impl Plugin<ParserHooks> for APlugin {
+    fn apply(&self, hook_container: &mut ParserHooks) {
         hook_container
-            .process_assets
-            .push(Arc::new(|_compilation: &mut Compilation| {
-                println!("APlugin: processAssets");
-            }));
+            .evaluate
+            .tap("CallExpression".to_string(), |_ast: &mut Ast| {
+                println!("APlugin: ParserHooks.evaluate");
+                Some(BasicEvaluatedExpression)
+            });
     }
 }
 
 struct BPlugin;
 
-#[async_trait]
-impl AsyncSeries<ProcessAssets> for BPlugin {
-    async fn run(&self, _compilation: &mut Compilation) {
-        println!("BPlugin: processAssets {}", AsyncSeries::stage(self));
-    }
-    fn stage(&self) -> i32 {
-        -100
-    }
-}
-
-impl Plugin<CompilationHooks> for Arc<BPlugin> {
-    fn tap_hooks(&self, hook_container: &mut CompilationHooks) {
-        hook_container
-            .make
-            .push(Arc::new(|_compilation: &Compilation| {
-                println!("BPlugin: make");
-            }));
-        hook_container.process_assets.push(self.clone());
+impl Plugin<CompilationHooks> for BPlugin {
+    fn apply(&self, hook_container: &mut CompilationHooks) {
+        hook_container.make.tap(|_compilation: &Compilation| async {
+            println!("BPlugin: CompilationHooks.make");
+        });
+        hook_container.process_assets.tap((
+            |_compilation: &mut Compilation| async {
+                println!("BPlugin: CompilationHooks.processAssets -100");
+            },
+            -100,
+        ));
     }
 }
 
 #[tokio::main]
 async fn main() {
     let mut compilation_hooks = CompilationHooks::default();
-    let a_plugin = Arc::new(APlugin);
-    a_plugin.tap_hooks(&mut compilation_hooks);
-    let b_plugin = Arc::new(BPlugin);
-    b_plugin.tap_hooks(&mut compilation_hooks);
+    let mut parser_hooks = ParserHooks::default();
+    let a_plugin = APlugin;
+    a_plugin.apply(&mut compilation_hooks);
+    a_plugin.apply(&mut parser_hooks);
+    let b_plugin = BPlugin;
+    b_plugin.apply(&mut compilation_hooks);
 
     let mut compilation = Compilation;
-    compilation_hooks.call_make(&compilation).await;
+    let mut ast = Ast;
+
+    let _evaluated = parser_hooks.evaluate.call("CallExpression", &mut ast);
+    compilation_hooks.make.call(&compilation).await;
     compilation_hooks
-        .call_process_assets(&mut compilation)
+        .process_assets
+        .call(&mut compilation)
         .await;
 }
